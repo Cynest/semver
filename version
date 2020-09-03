@@ -1,0 +1,191 @@
+#!/bin/bash
+#
+# Print semver version, RPM release number, and semver metadata from a git
+# repository
+
+set -eo pipefail
+
+usage() {
+    cat <<EOM
+usage: versions.sh [options] <ref>
+
+Extract semver version info plus metadata from the input reference object in a
+git repository.  For refs not matching valid semver tags version info will be
+created from git HEAD using info such as commit count, commit hash, and closest
+tag name.
+
+  -t   process <ref> as if it were a valid tag
+  -b   process <ref> as if it were a branch (skip valid tag check)
+  -m   match tags based on glob pattern (see git describe man page)
+
+Versioning hierarchy:
+1. Tags with valid version
+   vX.Y.Z-metadata:
+     VERSION=X.Y.Z
+     RELEASE=1
+     METADATA=+metadata
+2. Tags with valid version plus release
+   vX.Y.Z-6_metadata
+     VERSION=X.Y.Z
+     RELEASE=6
+     METADATA=+metadata
+3. Tags without valid version
+   test_feature
+     VERSION=0.2.COMMITCOUNT
+     RELEASE=1
+     METADATA=+test.feature
+3. Branch name
+   master
+     VERSION=0.1.COMMITCOUNT
+     RELEASE=1
+     METADATA=+master.sha.28c510f4
+4. Commit or HEAD
+   HEAD
+     VERSION=0.0.COMMITCOUNT
+     RELEASE=1
+     METADATA=+CLOSESTREF.sha.28c510f4
+
+With this versioning hierarchy tag builds take precedence over master branch
+builds which take precedence over fallback builds where no valid versioning
+can be found.
+
+EOM
+}
+
+# detect if ref is a tag, branch, or commit
+tag_branch_or_commit() {
+    # detect if HEAD is on a tag
+    if [[ "$ref" == "HEAD" ]]; then
+        if [[ ! -z ${match} ]]; then
+            MATCHARG="--match ${match}"
+        fi
+        local closesttag=$(git describe --tags ${MATCHARG} --abbrev=0 HEAD)
+        if [[ $(git rev-list --count HEAD ^${closesttag}) -eq 0 ]]; then
+            ref=$closesttag
+            reftype="tag"
+            return
+        elif git symbolic-ref HEAD > /dev/null 2>&1; then
+            ref=$(git symbolic-ref HEAD 2> /dev/null | cut -b 12-)
+            reftype="branch"
+            return
+        else
+            reftype="commit"
+            return
+        fi
+    fi
+    # detect what type of ref provided
+    if git show-ref -q --verify refs/tags/"$ref"; then
+        reftype="tag"
+    elif git show-ref -q --verify refs/heads/"$ref"; then
+        reftype="branch"
+    elif [[ "$ref" == "HEAD" ]]; then
+        reftype="commit"
+    else
+        echo "error: no matching tag or branch for \"$ref\"" >&2
+        exit 1
+    fi
+}
+
+version_from_tag() {
+    if [[ $# -ne 1 ]]; then
+        exit 1
+    fi
+    local tag=$1
+    if [[ "$tag" =~ ^v([0-9]+(\.[0-9]+)*)(.*)$ ]]; then
+        version=${BASH_REMATCH[1]}
+        local length=${#BASH_REMATCH[@]}
+        local remainder=${BASH_REMATCH[((${length}-1))]}
+        if [[ "$remainder" =~ ^-([0-9]+)(.*)$ ]]; then
+            release=${BASH_REMATCH[1]}
+            remainder=${BASH_REMATCH[2]}
+        elif [[ "$remainder" =~ ^-*rc[0-9]+.*$ ]]; then
+            release=0
+            vcount=$(git tag -l "v${version}*" | wc -l)
+            remainder="+${vcount}${remainder/-*rc[0-9]+}"
+        else
+            release=1
+        fi
+        version="${version:-0}"
+        release="${release:-1}"
+        metadata=${remainder/#[-_]/+}
+        metadata=${metadata//[-_\/]/.}
+    else
+        count=$(git rev-list --count --no-merges HEAD)
+        version=0.2.${count}
+        release=1
+        commit=$(git rev-list --max-count=1 HEAD)
+        metadata="+${tag//[-_\/]/.}.sha.${commit:0:8}"
+    fi
+}
+
+version_from_branch() {
+    if [[ $# -ne 1 ]]; then
+        exit 1
+    fi
+    local branch=$1
+    count=$(git rev-list --count --no-merges $branch)
+    commit=$(git rev-list --max-count=1 $branch)
+    version=0.1.${count}
+    release=1
+    metadata="+${branch//[-_\/]/.}.sha.${commit:0:8}"
+}
+
+version_default() {
+    count=$(git rev-list --count --no-merges HEAD)
+    commit=$(git rev-list --max-count=1 HEAD)
+    closestref=$(git describe --all --abbrev=0 HEAD)
+    version=0.0.${count}
+    release=1
+    metadata="+${closestref//[-_\/]/.}.sha.${commit:0:8}"
+}
+
+main() {
+    while getopts "btm:h" arg; do
+        case $arg in
+            b)
+                reftype="branch"
+                ;;
+            t)
+                reftype="tag"
+                ;;
+            m)
+                match=$OPTARG
+                ;;
+            h)
+                usage
+                exit 0
+                ;;
+            ?)
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    shift $((OPTIND -1))
+
+    if [[ $# -eq 0 ]]; then
+        ref=HEAD
+    else
+        ref=$1
+    fi
+    tag_branch_or_commit
+
+    case "$reftype" in
+        "tag")
+            version_from_tag "$ref"
+            ;;
+        "branch")
+            version_from_branch "$ref"
+            ;;
+        "commit")
+            version_default
+            ;;
+    esac
+
+    echo "VERSION=$version"
+    echo "RELEASE=$release"
+    echo "METADATA=$metadata"
+}
+
+main "$@"
